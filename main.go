@@ -163,7 +163,7 @@ func main() {
 
 			// Send any accumulated metrics before shutdown
 			if actualNetdataEnabled && (accumulatedSummary.FilesTransferred > 0 || runCounter > 0) {
-				if err := sendToNetdata(actualNetdataAddress, &accumulatedSummary, runCounter); err != nil {
+				if err := sendShutdownMetrics(actualNetdataAddress, &accumulatedSummary, runCounter); err != nil {
 					log.Printf("Error sending final metrics to Netdata: %v", err)
 				} else {
 					log.Println("Final metrics sent to Netdata")
@@ -188,6 +188,13 @@ func main() {
 				log.Printf("Error processing files: %v", err)
 			}
 
+			// Send individual run metrics to Netdata immediately
+			if actualNetdataEnabled {
+				if err := sendToNetdata(actualNetdataAddress, &summary, 1); err != nil {
+					log.Printf("Error sending metrics to Netdata: %v", err)
+				}
+			}
+
 			accumulatedSummary.FilesTransferred += summary.FilesTransferred
 			accumulatedSummary.FilesDeleted += summary.FilesDeleted
 			accumulatedSummary.TotalBytes += summary.TotalBytes
@@ -202,11 +209,6 @@ func main() {
 						"Summary over last %d runs (~%v): %d files transferred, %d files deleted, %.2f MB, %d files failed to delete.",
 						runCounter, loggingInterval, accumulatedSummary.FilesTransferred, accumulatedSummary.FilesDeleted, totalMegabytes, len(accumulatedSummary.FilesFailed),
 					)
-					if actualNetdataEnabled {
-						if err := sendToNetdata(actualNetdataAddress, &accumulatedSummary, runCounter); err != nil {
-							log.Printf("Error sending metrics to Netdata: %v", err)
-						}
-					}
 				}
 				runCounter = 0
 				accumulatedSummary = Summary{}
@@ -294,16 +296,28 @@ func runS5cmd(folderPrefix, s3BucketPath, awsCredsFile, jsonOutputFile, pathSuff
 func sendToNetdata(address string, summary *Summary, runCount int) error {
 	conn, err := net.Dial("udp", address)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connect to Netdata at %s: %w", address, err)
 	}
 	defer conn.Close()
 
+	// Calculate derived metrics
+	megabytesTransferred := float64(summary.TotalBytes) / (1024 * 1024)
+	successRate := 0.0
+	if summary.FilesTransferred > 0 {
+		successRate = float64(summary.FilesDeleted) / float64(summary.FilesTransferred) * 100.0
+	}
+
 	metrics := []string{
-		fmt.Sprintf("s5commander.files_transferred:%d|g", summary.FilesTransferred),
-		fmt.Sprintf("s5commander.files_deleted:%d|g", summary.FilesDeleted),
-		fmt.Sprintf("s5commander.megabytes_transferred:%.2f|g", float64(summary.TotalBytes)/(1024*1024)),
-		fmt.Sprintf("s5commander.files_failed_delete:%d|g", len(summary.FilesFailed)),
-		fmt.Sprintf("s5commander.runs:%d|g", runCount),
+		// Current run metrics (these reset each run)
+		fmt.Sprintf("s5commander.current.files_transferred:%d|g", summary.FilesTransferred),
+		fmt.Sprintf("s5commander.current.files_deleted:%d|g", summary.FilesDeleted),
+		fmt.Sprintf("s5commander.current.megabytes_transferred:%.2f|g", megabytesTransferred),
+		fmt.Sprintf("s5commander.current.files_failed_delete:%d|g", len(summary.FilesFailed)),
+		fmt.Sprintf("s5commander.current.success_rate:%.2f|g", successRate),
+
+		// Operational metrics
+		fmt.Sprintf("s5commander.runs_completed:%d|c", runCount),
+		fmt.Sprintf("s5commander.last_activity:%d|g", time.Now().Unix()),
 	}
 
 	for _, metric := range metrics {
@@ -384,4 +398,37 @@ func parseAndCleanup(folderPrefix, jsonOutputFile string) (Summary, error) {
 	}
 
 	return summary, nil
+}
+
+func sendShutdownMetrics(address string, summary *Summary, totalRuns int) error {
+	conn, err := net.Dial("udp", address)
+	if err != nil {
+		return fmt.Errorf("failed to connect to Netdata at %s: %w", address, err)
+	}
+	defer conn.Close()
+
+	megabytesTransferred := float64(summary.TotalBytes) / (1024 * 1024)
+	successRate := 0.0
+	if summary.FilesTransferred > 0 {
+		successRate = float64(summary.FilesDeleted) / float64(summary.FilesTransferred) * 100.0
+	}
+
+	metrics := []string{
+		// Final session metrics
+		fmt.Sprintf("s5commander.session.final_files_transferred:%d|g", summary.FilesTransferred),
+		fmt.Sprintf("s5commander.session.final_files_deleted:%d|g", summary.FilesDeleted),
+		fmt.Sprintf("s5commander.session.final_megabytes_transferred:%.2f|g", megabytesTransferred),
+		fmt.Sprintf("s5commander.session.final_files_failed_delete:%d|g", len(summary.FilesFailed)),
+		fmt.Sprintf("s5commander.session.final_success_rate:%.2f|g", successRate),
+		fmt.Sprintf("s5commander.session.total_runs:%d|g", totalRuns),
+		fmt.Sprintf("s5commander.shutdown:%d|c", 1),
+	}
+
+	for _, metric := range metrics {
+		_, err := fmt.Fprint(conn, metric)
+		if err != nil {
+			// Log individual metric send errors if needed, but for UDP it's often fire-and-forget
+		}
+	}
+	return nil
 }

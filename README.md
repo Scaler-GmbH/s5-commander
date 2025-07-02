@@ -4,8 +4,8 @@ This application is responsible for offloading files from the current server to 
 
 ## Prerequisites
 
-- Go 1.22 or higher installed.
-- `s5cmd` tool installed and available in the system's PATH.
+- Go 1.24.4 or higher installed.
+- `s5cmd` tool installed and available in the system's PATH or path provided via environment variable.
 
 ## Installation
 
@@ -122,13 +122,23 @@ The application handles graceful shutdowns when receiving `SIGINT` (Ctrl+C) or `
 
 ### Netdata Integration
 
-When enabled, the application sends the following metrics to Netdata via StatsD:
+When enabled, the application sends metrics to Netdata via StatsD after each processing run, providing real-time monitoring:
 
-- `s5commander.files_transferred`: Number of files successfully transferred
-- `s5commander.files_deleted`: Number of files successfully deleted locally
-- `s5commander.megabytes_transferred`: Total megabytes transferred
-- `s5commander.files_failed_delete`: Number of files that failed to delete locally
-- `s5commander.runs`: Number of processing runs completed
+#### Current Run Metrics (reset each run):
+- `s5commander.current.files_transferred`: Files successfully transferred in last run
+- `s5commander.current.files_deleted`: Files successfully deleted locally in last run  
+- `s5commander.current.megabytes_transferred`: Megabytes transferred in last run
+- `s5commander.current.files_failed_delete`: Files that failed to delete in last run
+- `s5commander.current.success_rate`: Percentage of transferred files successfully deleted
+
+#### Operational Metrics:
+- `s5commander.runs_completed`: Number of processing runs completed
+- `s5commander.last_activity`: Unix timestamp of last activity
+- `s5commander.shutdown`: Counter incremented on graceful shutdown
+
+#### Session Summary Metrics (sent on shutdown):
+- `s5commander.session.final_*`: Final accumulated totals for the session
+- `s5commander.session.total_runs`: Total runs completed in the session
 
 ### Flexible Configuration
 
