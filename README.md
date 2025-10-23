@@ -70,6 +70,8 @@ go run main.go
 | `--folder-prefix` | `FOLDER_PREFIX` | `/tmp/` | Folder prefix for files to be offloaded |
 | `--s3-bucket-path` | `S3_BUCKET_PATH` | *(required)* | S3 bucket path (e.g., s3://my-bucket/path/) |
 | `--aws-creds-file` | `AWS_CREDS_FILE` | *(see AWS config)* | Path to AWS credentials file |
+| `--aws-endpoint-url` | `AWS_ENDPOINT_URL` | `https://s3.amazonaws.com` | Custom AWS endpoint |
+| `--aws-profile` | `AWS_PROFILE` | `default` | AWS profile to use from credentials file |
 | `--path-suffix` | `PATH_SUFFIX` | `/**/**/*.gz` | Path suffix to use for glob matching |
 | `--process-interval` | `PROCESS_INTERVAL` | `1s` | Interval between processing runs |
 | `--netdata-enabled` | `NETDATA_ENABLED` | `false` | Enable sending metrics to Netdata |
@@ -84,6 +86,10 @@ You have two options for AWS credentials:
 2. **Environment Variables**: Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_DEFAULT_REGION`
 
 If both are provided, environment variables take precedence. At least one method must be configured.
+
+Additionally, when using a credentials file, you can specify the AWS profile with `--aws-profile` (or `AWS_PROFILE` env var, default: `default`).
+
+For custom S3-compatible endpoints, use `--aws-endpoint-url` (or `AWS_ENDPOINT_URL` env var, default: `https://s3.amazonaws.com`).
 
 ### S5cmd Binary Configuration
 

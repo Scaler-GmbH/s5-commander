@@ -86,25 +86,35 @@ func getEnvOrFlagBool(envKey string, flagValue bool) bool {
 }
 
 func main() {
+	// operational flags
 	folderPrefix := flag.String("folder-prefix", "/tmp/", "Folder prefix for files to be offloaded (env: FOLDER_PREFIX)")
-	s3BucketPath := flag.String("s3-bucket-path", "", "S3 bucket path (e.g., s3://my-bucket/path/) (env: S3_BUCKET_PATH)")
-	awsCredsFile := flag.String("aws-creds-file", "", "Path to AWS credentials file (env: AWS_CREDS_FILE)")
 	pathSuffix := flag.String("path-suffix", "/**/**/*.gz", "the path suffix to use for glob matching (env: PATH_SUFFIX)")
 	processInterval := flag.Duration("process-interval", 1*time.Second, "The interval between processing runs (env: PROCESS_INTERVAL)")
 	netdataEnabled := flag.Bool("netdata-enabled", false, "Enable sending metrics to Netdata (env: NETDATA_ENABLED)")
 	netdataAddress := flag.String("netdata-address", "127.0.0.1:8125", "Netdata statsd address (UDP) (env: NETDATA_ADDRESS)")
 	s5cmdBinary := flag.String("s5cmd-binary", "s5cmd", "Full path to s5cmd binary (env: S5CMD_BINARY)")
+
+	// s3-like storage flags
+	s3BucketPath := flag.String("s3-bucket-path", "", "S3 bucket path (e.g., s3://my-bucket/path/) (env: S3_BUCKET_PATH)")
+	awsCredsFile := flag.String("aws-creds-file", "", "Path to AWS credentials file (env: AWS_CREDS_FILE)")
+	awsEndpointURL := flag.String("aws-endpoint-url", "https://s3.amazonaws.com", "Custom AWS endpoint (env: AWS_ENDPOINT_URL)")
+	awsProfile := flag.String("aws-profile", "default", "AWS profile to use from credentials file (env: AWS_PROFILE)")
+
 	flag.Parse()
 
 	// Get actual values from environment variables with flag fallbacks
 	actualFolderPrefix := getEnvOrFlag("FOLDER_PREFIX", *folderPrefix)
-	actualS3BucketPath := getEnvOrFlag("S3_BUCKET_PATH", *s3BucketPath)
-	actualAwsCredsFile := getEnvOrFlag("AWS_CREDS_FILE", *awsCredsFile)
 	actualPathSuffix := getEnvOrFlag("PATH_SUFFIX", *pathSuffix)
 	actualProcessInterval := getEnvOrFlagDuration("PROCESS_INTERVAL", *processInterval)
 	actualNetdataEnabled := getEnvOrFlagBool("NETDATA_ENABLED", *netdataEnabled)
 	actualNetdataAddress := getEnvOrFlag("NETDATA_ADDRESS", *netdataAddress)
 	actualS5cmdBinary := getEnvOrFlag("S5CMD_BINARY", *s5cmdBinary)
+
+	// If AWS endpoint, creds file, profile, or S3 bucket path are set via env vars, override flags
+	actualAwsEndpointURL := getEnvOrFlag("AWS_ENDPOINT_URL", *awsEndpointURL)
+	actualAwsCredsFile := getEnvOrFlag("AWS_CREDS_FILE", *awsCredsFile)
+	actualAwsProfile := getEnvOrFlag("AWS_PROFILE", *awsProfile)
+	actualS3BucketPath := getEnvOrFlag("S3_BUCKET_PATH", *s3BucketPath)
 
 	// Check for AWS credentials in environment variables
 	awsAccessKeyID := os.Getenv("AWS_ACCESS_KEY_ID")
@@ -175,7 +185,11 @@ func main() {
 				totalMegabytes := float64(accumulatedSummary.TotalBytes) / (1024 * 1024)
 				log.Printf(
 					"Final summary: %d files transferred, %d files deleted, %.2f MB, %d files failed to delete over %d runs.",
-					accumulatedSummary.FilesTransferred, accumulatedSummary.FilesDeleted, totalMegabytes, len(accumulatedSummary.FilesFailed), runCounter,
+					accumulatedSummary.FilesTransferred,
+					accumulatedSummary.FilesDeleted,
+					totalMegabytes,
+					len(accumulatedSummary.FilesFailed),
+					runCounter,
 				)
 			}
 
@@ -183,7 +197,16 @@ func main() {
 			return
 
 		case <-ticker.C:
-			summary, err := processFiles(actualFolderPrefix, actualS3BucketPath, actualAwsCredsFile, actualPathSuffix, actualS5cmdBinary, hasAwsEnvCreds)
+			summary, err := processFiles(
+				actualFolderPrefix,
+				actualAwsEndpointURL,
+				actualS3BucketPath,
+				actualAwsCredsFile,
+				actualAwsProfile,
+				actualPathSuffix,
+				actualS5cmdBinary,
+				hasAwsEnvCreds,
+			)
 			if err != nil {
 				log.Printf("Error processing files: %v", err)
 			}
@@ -207,7 +230,12 @@ func main() {
 					totalMegabytes := float64(accumulatedSummary.TotalBytes) / (1024 * 1024)
 					log.Printf(
 						"Summary over last %d runs (~%v): %d files transferred, %d files deleted, %.2f MB, %d files failed to delete.",
-						runCounter, loggingInterval, accumulatedSummary.FilesTransferred, accumulatedSummary.FilesDeleted, totalMegabytes, len(accumulatedSummary.FilesFailed),
+						runCounter,
+						loggingInterval,
+						accumulatedSummary.FilesTransferred,
+						accumulatedSummary.FilesDeleted,
+						totalMegabytes,
+						len(accumulatedSummary.FilesFailed),
 					)
 				}
 				runCounter = 0
@@ -217,7 +245,7 @@ func main() {
 	}
 }
 
-func processFiles(folderPrefix, s3BucketPath, awsCredsFile, pathSuffix, s5cmdBinary string, hasAwsEnvCreds bool) (Summary, error) {
+func processFiles(folderPrefix, awsEndpointURL, s3BucketPath, awsCredsFile, awsProfile, pathSuffix, s5cmdBinary string, hasAwsEnvCreds bool) (Summary, error) {
 	jobID, err := uuid.NewRandom()
 	if err != nil {
 		return Summary{}, fmt.Errorf("error generating job ID: %v", err)
@@ -226,7 +254,7 @@ func processFiles(folderPrefix, s3BucketPath, awsCredsFile, pathSuffix, s5cmdBin
 	jsonOutputFile := fmt.Sprintf("%s.json", jobID)
 	defer os.Remove(jsonOutputFile)
 
-	err = runS5cmd(folderPrefix, s3BucketPath, awsCredsFile, jsonOutputFile, pathSuffix, s5cmdBinary, hasAwsEnvCreds)
+	err = runS5cmd(folderPrefix, awsEndpointURL, s3BucketPath, awsCredsFile, awsProfile, jsonOutputFile, pathSuffix, s5cmdBinary, hasAwsEnvCreds)
 	if err != nil {
 		isNoMatchError, _ := checkForNoMatchError(jsonOutputFile)
 		if isNoMatchError {
@@ -244,7 +272,7 @@ func processFiles(folderPrefix, s3BucketPath, awsCredsFile, pathSuffix, s5cmdBin
 	return summary, nil
 }
 
-func runS5cmd(folderPrefix, s3BucketPath, awsCredsFile, jsonOutputFile, pathSuffix, s5cmdBinary string, hasAwsEnvCreds bool) error {
+func runS5cmd(folderPrefix, awsEndpointURL, s3BucketPath, awsCredsFile, awsProfile, jsonOutputFile, pathSuffix, s5cmdBinary string, hasAwsEnvCreds bool) error {
 	if len(pathSuffix) > 0 && pathSuffix[0] == '/' {
 		pathSuffix = pathSuffix[1:]
 	}
@@ -257,6 +285,7 @@ func runS5cmd(folderPrefix, s3BucketPath, awsCredsFile, jsonOutputFile, pathSuff
 		cmd = exec.Command(s5cmdBinary,
 			"--json",
 			"--log", LogLevel,
+			"--endpoint-url", awsEndpointURL,
 			"cp",
 			srcPath,
 			destPath,
@@ -273,6 +302,8 @@ func runS5cmd(folderPrefix, s3BucketPath, awsCredsFile, jsonOutputFile, pathSuff
 			"--json",
 			"--log", LogLevel,
 			"--credentials-file", awsCredsFile,
+			"--profile", awsProfile,
+			"--endpoint-url", awsEndpointURL,
 			"cp",
 			srcPath,
 			destPath,
