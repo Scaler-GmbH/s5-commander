@@ -22,7 +22,7 @@ import (
 
 const (
 	// LogLevel defines the logging level for s5cmd
-	LogLevel = "debug"
+	LogLevel = "info"
 	// DateFormat defines the date format for directory paths
 	DateFormat = "2006-01-02"
 )
