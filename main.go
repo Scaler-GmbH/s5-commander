@@ -295,6 +295,12 @@ func runS5cmd(folderPrefix, awsEndpointURL, s3BucketPath, awsCredsFile, awsProfi
 	// build the full command based on whether we have env creds or file creds
 	if hasAwsEnvCreds {
 		cmdArguments = append(cmdArguments, "cp", srcPath, destPath)
+		cmd = exec.Command(s5cmdBinary, cmdArguments...)
+		cmd.Env = append(os.Environ(),
+			fmt.Sprintf("AWS_ACCESS_KEY_ID=%s", os.Getenv("AWS_ACCESS_KEY_ID")),
+			fmt.Sprintf("AWS_SECRET_ACCESS_KEY=%s", os.Getenv("AWS_SECRET_ACCESS_KEY")),
+			fmt.Sprintf("AWS_DEFAULT_REGION=%s", os.Getenv("AWS_DEFAULT_REGION")),
+		)
 	} else {
 		cmdArguments = append(cmdArguments,
 			"--credentials-file", awsCredsFile,
@@ -303,18 +309,7 @@ func runS5cmd(folderPrefix, awsEndpointURL, s3BucketPath, awsCredsFile, awsProfi
 			srcPath,
 			destPath,
 		)
-	}
-
-	cmd = exec.Command(s5cmdBinary, cmdArguments...)
-
-	// set environment variables for the command if needed
-	if hasAwsEnvCreds {
-		cmd.Env = append(os.Environ(),
-			fmt.Sprintf("AWS_ACCESS_KEY_ID=%s", os.Getenv("AWS_ACCESS_KEY_ID")),
-			fmt.Sprintf("AWS_SECRET_ACCESS_KEY=%s", os.Getenv("AWS_SECRET_ACCESS_KEY")),
-			fmt.Sprintf("AWS_DEFAULT_REGION=%s", os.Getenv("AWS_DEFAULT_REGION")),
-		)
-	} else {
+		cmd = exec.Command(s5cmdBinary, cmdArguments...)
 		cmd.Env = os.Environ()
 	}
 
