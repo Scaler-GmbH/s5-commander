@@ -97,7 +97,7 @@ func main() {
 	// s3-like storage flags
 	s3BucketPath := flag.String("s3-bucket-path", "", "S3 bucket path (e.g., s3://my-bucket/path/) (env: S3_BUCKET_PATH)")
 	awsCredsFile := flag.String("aws-creds-file", "", "Path to AWS credentials file (env: AWS_CREDS_FILE)")
-	awsEndpointURL := flag.String("aws-endpoint-url", "https://s3.amazonaws.com", "Custom AWS endpoint (env: AWS_ENDPOINT_URL)")
+	awsEndpointURL := flag.String("aws-endpoint-url", "", "Custom AWS endpoint (env: AWS_ENDPOINT_URL)")
 	awsProfile := flag.String("aws-profile", "default", "AWS profile to use from credentials file (env: AWS_PROFILE)")
 
 	flag.Parse()
@@ -280,37 +280,40 @@ func runS5cmd(folderPrefix, awsEndpointURL, s3BucketPath, awsCredsFile, awsProfi
 	destPath := s3BucketPath
 
 	var cmd *exec.Cmd
+
+	// build default arguments
+	cmdArguments := []string{
+		"--json",
+		"--log", LogLevel,
+	}
+
+	// if we have an endpoint provided, add it to the arguments
+	if awsEndpointURL != "" {
+		cmdArguments = append(cmdArguments, "--endpoint-url", awsEndpointURL)
+	}
+
+	// build the full command based on whether we have env creds or file creds
 	if hasAwsEnvCreds {
-		// Use environment variables for AWS credentials
-		cmd = exec.Command(s5cmdBinary,
-			"--json",
-			"--log", LogLevel,
-			"--endpoint-url", awsEndpointURL,
-			"cp",
-			srcPath,
-			destPath,
-		)
-		// Ensure AWS environment variables are passed to s5cmd
+		cmdArguments = append(cmdArguments, "cp", srcPath, destPath)
+		cmd = exec.Command(s5cmdBinary, cmdArguments...)
 		cmd.Env = append(os.Environ(),
 			fmt.Sprintf("AWS_ACCESS_KEY_ID=%s", os.Getenv("AWS_ACCESS_KEY_ID")),
 			fmt.Sprintf("AWS_SECRET_ACCESS_KEY=%s", os.Getenv("AWS_SECRET_ACCESS_KEY")),
 			fmt.Sprintf("AWS_DEFAULT_REGION=%s", os.Getenv("AWS_DEFAULT_REGION")),
 		)
 	} else {
-		// Use credentials file
-		cmd = exec.Command(s5cmdBinary,
-			"--json",
-			"--log", LogLevel,
+		cmdArguments = append(cmdArguments,
 			"--credentials-file", awsCredsFile,
 			"--profile", awsProfile,
-			"--endpoint-url", awsEndpointURL,
 			"cp",
 			srcPath,
 			destPath,
 		)
+		cmd = exec.Command(s5cmdBinary, cmdArguments...)
 		cmd.Env = os.Environ()
 	}
 
+	// redirect output to the JSON output file
 	outputFile, err := os.Create(jsonOutputFile)
 	if err != nil {
 		return fmt.Errorf("error creating output file: %w", err)
