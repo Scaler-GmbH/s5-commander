@@ -52,6 +52,9 @@ type Summary struct {
 	FilesDeleted     int
 	TotalBytes       int64
 	FilesFailed      []string
+	// FilesPending and PerDest are only populated in multi-destination mode.
+	FilesPending int
+	PerDest      map[string]*DestSummary
 }
 
 // getEnvOrFlag returns the environment variable value if set, otherwise returns the flag value
@@ -122,21 +125,48 @@ func main() {
 	awsDefaultRegion := os.Getenv("AWS_DEFAULT_REGION")
 	hasAwsEnvCreds := awsAccessKeyID != "" && awsSecretAccessKey != "" && awsDefaultRegion != ""
 
-	if actualS3BucketPath == "" {
-		log.Fatal("s3-bucket-path (or S3_BUCKET_PATH env var) is required")
+	legacyDest := Destination{
+		Name:        LegacyDestinationName,
+		BucketPath:  actualS3BucketPath,
+		EndpointURL: actualAwsEndpointURL,
+		CredsFile:   actualAwsCredsFile,
+		Profile:     actualAwsProfile,
+		Legacy:      true,
+	}
+	if hasAwsEnvCreds {
+		legacyDest.AccessKeyID = awsAccessKeyID
+		legacyDest.SecretAccessKey = awsSecretAccessKey
+		legacyDest.Region = awsDefaultRegion
 	}
 
-	if actualAwsCredsFile == "" && !hasAwsEnvCreds {
-		log.Fatal("Either aws-creds-file (or AWS_CREDS_FILE env var) or AWS environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION) are required")
+	dests, err := loadDestinations(legacyDest, os.Getenv, os.Environ())
+	if err != nil {
+		log.Fatal(err)
 	}
+	legacyMode := len(dests) == 1 && dests[0].Legacy
 
 	// Log startup configuration
-	if hasAwsEnvCreds {
-		log.Printf("Using AWS credentials from environment variables (region: %s)", awsDefaultRegion)
+	if legacyMode {
+		if hasAwsEnvCreds {
+			log.Printf("Using AWS credentials from environment variables (region: %s)", awsDefaultRegion)
+		} else {
+			log.Printf("Using AWS credentials from file: %s", actualAwsCredsFile)
+		}
 	} else {
-		log.Printf("Using AWS credentials from file: %s", actualAwsCredsFile)
+		for _, d := range dests {
+			if d.hasEnvCreds() {
+				log.Printf("Destination %q: %s (credentials from environment variables, region: %s)", d.Name, d.BucketPath, d.Region)
+			} else {
+				log.Printf("Destination %q: %s (credentials from file: %s, profile: %s)", d.Name, d.BucketPath, d.CredsFile, d.Profile)
+			}
+		}
 	}
 	log.Printf("Using s5cmd binary: %s", actualS5cmdBinary)
+
+	var multi *multiProcessor
+	if !legacyMode {
+		multi = newMultiProcessor(dests, actualFolderPrefix, actualPathSuffix, actualS5cmdBinary)
+	}
 
 	// Set up graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -178,6 +208,11 @@ func main() {
 				} else {
 					log.Println("Final metrics sent to Netdata")
 				}
+				if multi != nil {
+					if err := sendDestinationShutdownMetrics(actualNetdataAddress, dests, &accumulatedSummary); err != nil {
+						log.Printf("Error sending final destination metrics to Netdata: %v", err)
+					}
+				}
 			}
 
 			// Log final summary if there's accumulated data
@@ -191,22 +226,31 @@ func main() {
 					len(accumulatedSummary.FilesFailed),
 					runCounter,
 				)
+				if multi != nil {
+					logDestinationSummaries(dests, &accumulatedSummary)
+				}
 			}
 
 			log.Println("s5-commander shutdown complete")
 			return
 
 		case <-ticker.C:
-			summary, err := processFiles(
-				actualFolderPrefix,
-				actualAwsEndpointURL,
-				actualS3BucketPath,
-				actualAwsCredsFile,
-				actualAwsProfile,
-				actualPathSuffix,
-				actualS5cmdBinary,
-				hasAwsEnvCreds,
-			)
+			var summary Summary
+			var err error
+			if multi != nil {
+				summary, err = multi.process()
+			} else {
+				summary, err = processFiles(
+					actualFolderPrefix,
+					actualAwsEndpointURL,
+					actualS3BucketPath,
+					actualAwsCredsFile,
+					actualAwsProfile,
+					actualPathSuffix,
+					actualS5cmdBinary,
+					hasAwsEnvCreds,
+				)
+			}
 			if err != nil {
 				log.Printf("Error processing files: %v", err)
 			}
@@ -216,12 +260,14 @@ func main() {
 				if err := sendToNetdata(actualNetdataAddress, &summary, 1); err != nil {
 					log.Printf("Error sending metrics to Netdata: %v", err)
 				}
+				if multi != nil {
+					if err := sendDestinationMetrics(actualNetdataAddress, dests, &summary, multi.lastSuccess); err != nil {
+						log.Printf("Error sending destination metrics to Netdata: %v", err)
+					}
+				}
 			}
 
-			accumulatedSummary.FilesTransferred += summary.FilesTransferred
-			accumulatedSummary.FilesDeleted += summary.FilesDeleted
-			accumulatedSummary.TotalBytes += summary.TotalBytes
-			accumulatedSummary.FilesFailed = append(accumulatedSummary.FilesFailed, summary.FilesFailed...)
+			accumulatedSummary.add(summary)
 
 			runCounter++
 
@@ -237,6 +283,9 @@ func main() {
 						totalMegabytes,
 						len(accumulatedSummary.FilesFailed),
 					)
+				}
+				if multi != nil {
+					logDestinationSummaries(dests, &accumulatedSummary)
 				}
 				runCounter = 0
 				accumulatedSummary = Summary{}
