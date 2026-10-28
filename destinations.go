@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -24,10 +25,12 @@ var (
 	bareBucketPattern = regexp.MustCompile(`^s3://[^/]+$`)
 )
 
-// Destination is one S3-compatible target that every file is copied to.
+// Destination is one target that every file is copied to: either an
+// S3-compatible bucket (BucketPath) or a local directory (FilePath).
 type Destination struct {
 	Name            string
 	BucketPath      string
+	FilePath        string
 	EndpointURL     string
 	CredsFile       string
 	Profile         string
@@ -41,6 +44,19 @@ type Destination struct {
 
 func (d Destination) hasEnvCreds() bool {
 	return d.AccessKeyID != "" && d.SecretAccessKey != "" && d.Region != ""
+}
+
+func (d Destination) isFile() bool {
+	return d.FilePath != ""
+}
+
+// location returns where a file with the given relative key is stored at this
+// destination.
+func (d Destination) location(relKey string) string {
+	if d.isFile() {
+		return filepath.Join(d.FilePath, filepath.FromSlash(relKey))
+	}
+	return d.keyPrefix() + relKey
 }
 
 // keyPrefix returns the bucket path in the form s5cmd uses as the prefix of
@@ -116,21 +132,40 @@ func loadDestinations(legacy Destination, getenv func(string) string, environ []
 	dests = append(dests, indexed...)
 
 	seen := map[string]bool{}
+	hasS3 := false
 	for _, d := range dests {
 		if seen[d.Name] {
 			return nil, fmt.Errorf("duplicate destination name %q", d.Name)
 		}
 		seen[d.Name] = true
+		if d.isFile() {
+			continue
+		}
+		hasS3 = true
 		if !strings.HasPrefix(d.BucketPath, "s3://") || (!strings.HasSuffix(d.BucketPath, "/") && !bareBucketPattern.MatchString(d.BucketPath)) {
 			return nil, fmt.Errorf("destination %q: bucket path %q must be a bucket (s3://bucket) or a prefix ending in '/'", d.Name, d.BucketPath)
 		}
 	}
+	// The object key layout is taken from an s5cmd dry-run against an S3
+	// destination, so file destinations cannot be used on their own.
+	if !hasS3 {
+		return nil, fmt.Errorf("at least one S3 destination (S3_BUCKET_PATH or DEST_n_S3_BUCKET_PATH) is required")
+	}
 	return dests, nil
+}
+
+func firstS3(dests []Destination) (Destination, bool) {
+	for _, d := range dests {
+		if !d.isFile() {
+			return d, true
+		}
+	}
+	return Destination{}, false
 }
 
 func loadIndexedDestinations(getenv func(string) string, environ []string) ([]Destination, error) {
 	var dests []Destination
-	for n := 1; getenv(fmt.Sprintf("DEST_%d_S3_BUCKET_PATH", n)) != ""; n++ {
+	for n := 1; getenv(fmt.Sprintf("DEST_%d_S3_BUCKET_PATH", n)) != "" || getenv(fmt.Sprintf("DEST_%d_FILE_PATH", n)) != ""; n++ {
 		get := func(key string) string { return getenv(fmt.Sprintf("DEST_%d_%s", n, key)) }
 
 		name := get("NAME")
@@ -140,6 +175,24 @@ func loadIndexedDestinations(getenv func(string) string, environ []string) ([]De
 		name = invalidNameChars.ReplaceAllString(name, "_")
 		if name == LegacyDestinationName {
 			return nil, fmt.Errorf("DEST_%d_NAME: %q is reserved for the S3_BUCKET_PATH destination", n, LegacyDestinationName)
+		}
+
+		if filePath := get("FILE_PATH"); filePath != "" {
+			if get("S3_BUCKET_PATH") != "" {
+				return nil, fmt.Errorf("DEST_%d: set either DEST_%d_S3_BUCKET_PATH or DEST_%d_FILE_PATH, not both", n, n, n)
+			}
+			if !filepath.IsAbs(filePath) {
+				return nil, fmt.Errorf("DEST_%d_FILE_PATH: %q must be an absolute path", n, filePath)
+			}
+			info, err := os.Stat(filePath)
+			if err != nil {
+				return nil, fmt.Errorf("DEST_%d_FILE_PATH: %w", n, err)
+			}
+			if !info.IsDir() {
+				return nil, fmt.Errorf("DEST_%d_FILE_PATH: %q is not a directory", n, filePath)
+			}
+			dests = append(dests, Destination{Name: name, FilePath: filepath.Clean(filePath)})
+			continue
 		}
 
 		profile := get("AWS_PROFILE")
@@ -177,7 +230,7 @@ func loadIndexedDestinations(getenv func(string) string, environ []string) ([]De
 	}
 	if len(orphaned) > 0 {
 		sort.Ints(orphaned)
-		return nil, fmt.Errorf("DEST_%d_* variables are set but DEST_%d_S3_BUCKET_PATH is missing (destinations must be numbered consecutively from 1)", orphaned[0], len(dests)+1)
+		return nil, fmt.Errorf("DEST_%d_* variables are set but DEST_%d_S3_BUCKET_PATH or DEST_%d_FILE_PATH is missing (destinations must be numbered consecutively from 1)", orphaned[0], len(dests)+1, len(dests)+1)
 	}
 
 	return dests, nil

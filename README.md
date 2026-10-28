@@ -1,6 +1,6 @@
 # S5 Commander
 
-This application is responsible for offloading files from the current server to one or more S3 buckets and cleaning up the files locally once they have been successfully transferred to every bucket. It uses the `s5cmd` tool to handle S3 copy operations.
+This application is responsible for offloading files from the current server to one or more S3 buckets (and optionally local directories) and cleaning up the files locally once they have been successfully transferred to every destination. It uses the `s5cmd` tool to handle S3 copy operations and can notify a webhook after each batch.
 
 ## Prerequisites
 
@@ -77,6 +77,9 @@ go run .
 | `--netdata-enabled` | `NETDATA_ENABLED` | `false` | Enable sending metrics to Netdata |
 | `--netdata-address` | `NETDATA_ADDRESS` | `127.0.0.1:8125` | Netdata statsd address (UDP) |
 | `--s5cmd-binary` | `S5CMD_BINARY` | `s5cmd` | Full path to s5cmd binary |
+| `--webhook-url` | `WEBHOOK_URL` | *(none)* | HTTP(S) endpoint that receives a JSON summary after each batch (see [Batch Webhook](#batch-webhook)) |
+| `--webhook-bearer-token` | `WEBHOOK_BEARER_TOKEN` | *(none)* | Token sent as `Authorization: Bearer <token>` |
+| `--webhook-timeout` | `WEBHOOK_TIMEOUT` | `10s` | Timeout for each webhook request |
 
 ### AWS Credentials Configuration
 
@@ -130,7 +133,59 @@ export DEST_1_AWS_DEFAULT_REGION="auto"
 go run .
 ```
 
-Every destination receives the same object keys (the layout `s5cmd cp` produces for the first destination). If a destination is unavailable, files stay on disk and are retried on the next run; destinations that already confirmed a file are not uploaded to again while the process is running.
+Every destination receives the same object keys (the layout `s5cmd cp` produces for the first S3 destination). If a destination is unavailable, files stay on disk and are retried on the next run; destinations that already confirmed a file are not uploaded to again while the process is running.
+
+### Local Directory Destinations
+
+A destination can also be a local directory (for example a mounted volume) instead of an S3 bucket. Set `DEST_n_FILE_PATH` instead of `DEST_n_S3_BUCKET_PATH`:
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `DEST_n_FILE_PATH` | *(required)* | Absolute path to an existing directory. Cannot be combined with `DEST_n_S3_BUCKET_PATH` |
+| `DEST_n_NAME` | `dest<n>` | Name used in logs and Netdata metrics |
+
+No credentials are needed for a local directory. At least one S3 destination is still required, because the key layout is taken from the S3 dry-run.
+
+Files are written under the same prefixes as the S3 object keys. If the S3 key is `s3://my-aws-bucket/logs/2026-10-26/host1/file.jsonl.gz` and `DEST_n_FILE_PATH` is `/mnt/data`, the local copy is `/mnt/data/2026-10-26/host1/file.jsonl.gz`. Missing directories are created.
+
+Local copies are made **before** any S3 upload starts. Each copy is written to a temporary file in the target directory, synced to disk, re-read and compared to the source by SHA-1 and size, and only then renamed into place. A failed or mismatched copy is discarded and retried on the next run, and the source file is kept until every destination (local and S3) has confirmed it.
+
+**Example:** an S3 bucket plus a local copy:
+
+```sh
+export S3_BUCKET_PATH="s3://my-aws-bucket/logs/"
+export AWS_CREDS_FILE="/etc/s5-commander/aws-credentials"
+
+export DEST_1_NAME="nas"
+export DEST_1_FILE_PATH="/mnt/data"
+
+go run .
+```
+
+Destinations can be listed in any order, so a local directory can just as well be `DEST_1` with the S3 bucket as `DEST_2`.
+
+### Batch Webhook
+
+When `WEBHOOK_URL` is set, a JSON array is POSTed to it after each processing run (batch) in which at least one file was copied somewhere. If `WEBHOOK_BEARER_TOKEN` is set, it is sent as `Authorization: Bearer <token>`. Prefer the environment variable over the flag, because command line flags are visible in the process list.
+
+Each entry describes one source file, identified by its SHA-1, and lists the locations it was successfully copied to **in that batch**:
+
+```json
+[
+  {
+    "sha1": "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed",
+    "s3": ["s3://my-aws-bucket/logs/2026-10-26/host1/file.jsonl.gz", "s3://my-r2-bucket/logs/2026-10-26/host1/file.jsonl.gz"],
+    "file": ["/mnt/data/2026-10-26/host1/file.jsonl.gz"]
+  }
+]
+```
+
+- A destination that failed for a file is left out of that file's `s3` or `file` list. `s3` and `file` are always arrays, possibly empty.
+- When a failed destination succeeds on a later run, that later batch reports the file again with only the newly copied location. Every successful copy is reported exactly once.
+- Files that were not copied anywhere in a batch are not included, and no request is sent for a batch without any successful copy.
+- Any 2xx response counts as success. Failed requests are retried twice (after 1s and 2s), then logged and dropped. The webhook never delays or prevents deleting source files.
+
+Setting `WEBHOOK_URL` with only the single `S3_BUCKET_PATH` destination switches to the multi-destination processing described below, because per-file results are needed.
 
 ### S5cmd Binary Configuration
 
@@ -215,10 +270,12 @@ The application runs continuously and performs the following steps in a loop:
 5. **Reports metrics**: Accumulated statistics are logged periodically and optionally sent to Netdata.
 6. **Waits**: After each run, the application waits for the specified process interval before starting the next cycle.
 
-With multiple destinations, each run works as follows instead:
+With multiple destinations (or a webhook), each run works as follows instead:
 
-1. **Discovers files**: `s5cmd --dry-run cp` against the first destination lists the matching files and their object keys, without uploading anything.
-2. **Uploads in parallel**: For each destination, an `s5cmd run` command file copies every file that destination has not yet confirmed, using that destination's own endpoint and credentials.
-3. **Deletes only fully delivered files**: A local file is deleted only after every destination has confirmed it. Files with partial delivery stay on disk and are retried on the next run.
+1. **Discovers files**: `s5cmd --dry-run cp` against the first S3 destination lists the matching files and their object keys, without uploading anything.
+2. **Copies to local directories first**: For each local directory destination, every file that destination has not yet confirmed is copied under the same key, verified by SHA-1 and renamed into place.
+3. **Uploads in parallel**: For each S3 destination, an `s5cmd run` command file copies every file that destination has not yet confirmed, using that destination's own endpoint and credentials.
+4. **Deletes only fully delivered files**: A local file is deleted only after every destination has confirmed it. Files with partial delivery stay on disk and are retried on the next run.
+5. **Sends the webhook**: If configured, the locations each file was copied to in this run are POSTed to the webhook.
 
 The application is designed to be a long-running service that continuously offloads files as they are generated, with proper monitoring and graceful shutdown capabilities. 
