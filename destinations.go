@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -37,6 +38,11 @@ type Destination struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	Region          string
+	// BaseURL is the public HTTP(S) URL of the bucket, used to report object
+	// locations to the webhook.
+	BaseURL string
+	// index is n for destinations configured via DEST_n_* variables.
+	index int
 	// Legacy marks the destination configured via the original single-bucket
 	// options. Its s5cmd process inherits the full environment, as before.
 	Legacy bool
@@ -57,6 +63,42 @@ func (d Destination) location(relKey string) string {
 		return filepath.Join(d.FilePath, filepath.FromSlash(relKey))
 	}
 	return d.keyPrefix() + relKey
+}
+
+// objectURL returns the HTTP(S) URL of the object stored under relKey: the
+// base URL followed by the object key within the bucket.
+func (d Destination) objectURL(relKey string) string {
+	_, prefix, _ := strings.Cut(strings.TrimPrefix(d.keyPrefix(), "s3://"), "/")
+	segments := strings.Split(prefix+relKey, "/")
+	for i, s := range segments {
+		// S3 decodes '+' in paths as a space, so it must be escaped too.
+		segments[i] = strings.ReplaceAll(url.PathEscape(s), "+", "%2B")
+	}
+	return d.BaseURL + "/" + strings.Join(segments, "/")
+}
+
+// validateBaseURL checks a configured base URL and returns it without a
+// trailing slash.
+func validateBaseURL(envVar, raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("%s: %q must be an http or https URL without query or fragment", envVar, raw)
+	}
+	return strings.TrimRight(raw, "/"), nil
+}
+
+// requireBaseURLs ensures every S3 destination can be reported to the webhook.
+func requireBaseURLs(dests []Destination) error {
+	for _, d := range dests {
+		if d.isFile() || d.BaseURL != "" {
+			continue
+		}
+		if d.Legacy {
+			return fmt.Errorf("s3-base-url (or S3_BASE_URL env var) is required when the webhook is enabled")
+		}
+		return fmt.Errorf("destination %q: DEST_%d_S3_BASE_URL is required when the webhook is enabled", d.Name, d.index)
+	}
+	return nil
 }
 
 // keyPrefix returns the bucket path in the form s5cmd uses as the prefix of
@@ -110,6 +152,11 @@ func loadDestinations(legacy Destination, getenv func(string) string, environ []
 	indexed, err := loadIndexedDestinations(getenv, environ)
 	if err != nil {
 		return nil, err
+	}
+	if legacy.BaseURL != "" {
+		if legacy.BaseURL, err = validateBaseURL("S3_BASE_URL", legacy.BaseURL); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(indexed) == 0 {
@@ -191,7 +238,7 @@ func loadIndexedDestinations(getenv func(string) string, environ []string) ([]De
 			if !info.IsDir() {
 				return nil, fmt.Errorf("DEST_%d_FILE_PATH: %q is not a directory", n, filePath)
 			}
-			dests = append(dests, Destination{Name: name, FilePath: filepath.Clean(filePath)})
+			dests = append(dests, Destination{Name: name, FilePath: filepath.Clean(filePath), index: n})
 			continue
 		}
 
@@ -209,9 +256,16 @@ func loadIndexedDestinations(getenv func(string) string, environ []string) ([]De
 			AccessKeyID:     get("AWS_ACCESS_KEY_ID"),
 			SecretAccessKey: get("AWS_SECRET_ACCESS_KEY"),
 			Region:          get("AWS_DEFAULT_REGION"),
+			index:           n,
 		}
 		if d.CredsFile == "" && !d.hasEnvCreds() {
 			return nil, fmt.Errorf("DEST_%d: either DEST_%d_AWS_CREDS_FILE or DEST_%d_AWS_ACCESS_KEY_ID, DEST_%d_AWS_SECRET_ACCESS_KEY and DEST_%d_AWS_DEFAULT_REGION are required", n, n, n, n, n)
+		}
+		if baseURL := get("S3_BASE_URL"); baseURL != "" {
+			var err error
+			if d.BaseURL, err = validateBaseURL(fmt.Sprintf("DEST_%d_S3_BASE_URL", n), baseURL); err != nil {
+				return nil, err
+			}
 		}
 		dests = append(dests, d)
 	}

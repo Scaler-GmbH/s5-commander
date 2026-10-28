@@ -80,6 +80,7 @@ go run .
 | `--webhook-url` | `WEBHOOK_URL` | *(none)* | HTTP(S) endpoint that receives a JSON summary after each batch (see [Batch Webhook](#batch-webhook)) |
 | `--webhook-bearer-token` | `WEBHOOK_BEARER_TOKEN` | *(none)* | Token sent as `Authorization: Bearer <token>` |
 | `--webhook-timeout` | `WEBHOOK_TIMEOUT` | `10s` | Timeout for each webhook request |
+| `--s3-base-url` | `S3_BASE_URL` | *(required with webhook)* | Public HTTP(S) URL of the bucket, used for webhook object URLs |
 
 ### AWS Credentials Configuration
 
@@ -110,6 +111,7 @@ Additional destinations are configured with numbered environment variables, star
 | `DEST_n_AWS_ACCESS_KEY_ID` | *(see below)* | Access key for this destination |
 | `DEST_n_AWS_SECRET_ACCESS_KEY` | *(see below)* | Secret key for this destination |
 | `DEST_n_AWS_DEFAULT_REGION` | *(see below)* | Region for this destination |
+| `DEST_n_S3_BASE_URL` | *(required with webhook)* | Public HTTP(S) URL of this bucket, used for webhook object URLs |
 
 Each destination needs either `DEST_n_AWS_CREDS_FILE` or all three of `DEST_n_AWS_ACCESS_KEY_ID`, `DEST_n_AWS_SECRET_ACCESS_KEY` and `DEST_n_AWS_DEFAULT_REGION`. The `s5cmd` process for a numbered destination never inherits other `AWS_*` variables, so credentials cannot leak between destinations.
 
@@ -168,14 +170,26 @@ Destinations can be listed in any order, so a local directory can just as well b
 
 When `WEBHOOK_URL` is set, a JSON array is POSTed to it after each processing run (batch) in which at least one file was copied somewhere. If `WEBHOOK_BEARER_TOKEN` is set, it is sent as `Authorization: Bearer <token>`. Prefer the environment variable over the flag, because command line flags are visible in the process list.
 
+Each S3 destination needs a base URL when the webhook is enabled, otherwise the application refuses to start. This is the HTTP(S) URL of the bucket itself, for example `https://my-aws-bucket.s3.amazonaws.com`, a path-style `https://s3.us-east-2.amazonaws.com/my-aws-bucket`, or a public R2 or CDN domain:
+
+| Flag | Environment Variable | Description |
+|------|---------------------|-------------|
+| `--s3-base-url` | `S3_BASE_URL` | Base URL of the `S3_BUCKET_PATH` bucket |
+| | `DEST_n_S3_BASE_URL` | Base URL of the `DEST_n_S3_BUCKET_PATH` bucket |
+
 Each entry describes one source file, identified by its SHA-1, and lists the locations it was successfully copied to **in that batch**:
+
+- `s3` holds the object URLs: the destination's base URL followed by the full object key, including any prefix from the bucket path. Characters that are not URL-safe are percent-encoded.
+- `file` holds paths relative to `DEST_n_FILE_PATH`, without a leading slash. These are the same as the object keys below the bucket path.
+
+With `S3_BUCKET_PATH=s3://my-aws-bucket/logs/`, `S3_BASE_URL=https://my-aws-bucket.s3.amazonaws.com`, an R2 destination with `DEST_1_S3_BASE_URL=https://pub-1234.r2.dev` and `DEST_2_FILE_PATH=/mnt/data`, a file stored as `/mnt/data/2026-10-26/host1/file.jsonl.gz` is reported as:
 
 ```json
 [
   {
     "sha1": "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed",
-    "s3": ["s3://my-aws-bucket/logs/2026-10-26/host1/file.jsonl.gz", "s3://my-r2-bucket/logs/2026-10-26/host1/file.jsonl.gz"],
-    "file": ["/mnt/data/2026-10-26/host1/file.jsonl.gz"]
+    "s3": ["https://my-aws-bucket.s3.amazonaws.com/logs/2026-10-26/host1/file.jsonl.gz", "https://pub-1234.r2.dev/logs/2026-10-26/host1/file.jsonl.gz"],
+    "file": ["2026-10-26/host1/file.jsonl.gz"]
   }
 ]
 ```

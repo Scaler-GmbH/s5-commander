@@ -196,7 +196,10 @@ func readLines(t *testing.T, path string) []string {
 }
 
 func fileAndS3Destinations(dir string) []Destination {
-	return append([]Destination{{Name: "local", FilePath: dir}}, twoDestinations()...)
+	dests := twoDestinations()
+	dests[0].BaseURL = "https://primary.s3.amazonaws.com"
+	dests[1].BaseURL = "https://backup.example.com"
+	return append([]Destination{{Name: "local", FilePath: dir}}, dests...)
 }
 
 func TestMultiFileDestinationCopiedBeforeS3(t *testing.T) {
@@ -353,8 +356,8 @@ func TestWebhookReportsIncrementalBatches(t *testing.T) {
 	}
 	want := []webhookEntry{{
 		SHA1: sha1Hex("12345"),
-		S3:   []string{"s3://primary/logs/sub/a.gz"},
-		File: []string{filepath.Join(out, "sub", "a.gz")},
+		S3:   []string{"https://primary.s3.amazonaws.com/logs/sub/a.gz"},
+		File: []string{"sub/a.gz"},
 	}}
 	if got := decodeEntries(t, bodies[0]); len(got) != 1 || got[0].SHA1 != want[0].SHA1 || !slices.Equal(got[0].S3, want[0].S3) || !slices.Equal(got[0].File, want[0].File) {
 		t.Fatalf("batch 1 payload = %s", bodies[0])
@@ -368,7 +371,7 @@ func TestWebhookReportsIncrementalBatches(t *testing.T) {
 	if len(bodies) != 1 {
 		t.Fatalf("expected one webhook request, got %q", bodies)
 	}
-	wantBody := `[{"sha1":"` + sha1Hex("12345") + `","s3":["s3://backup/sub/a.gz"],"file":[]}]`
+	wantBody := `[{"sha1":"` + sha1Hex("12345") + `","s3":["https://backup.example.com/sub/a.gz"],"file":[]}]`
 	if bodies[0] != wantBody {
 		t.Fatalf("batch 2 payload = %s, want %s", bodies[0], wantBody)
 	}
@@ -378,8 +381,8 @@ func TestWebhookSkipsBatchWithoutSuccess(t *testing.T) {
 	h := newMultiHarness(t, "a.gz")
 	rec, notifier := newWebhookServer(t)
 	dests := []Destination{
-		{Name: "a", BucketPath: "s3://primary/logs/", AccessKeyID: "KX", SecretAccessKey: "S", Region: "r"},
-		{Name: "b", BucketPath: "s3://backup/", AccessKeyID: "KX", SecretAccessKey: "S", Region: "r"},
+		{Name: "a", BucketPath: "s3://primary/logs/", AccessKeyID: "KX", SecretAccessKey: "S", Region: "r", BaseURL: "https://primary.s3.amazonaws.com"},
+		{Name: "b", BucketPath: "s3://backup/", AccessKeyID: "KX", SecretAccessKey: "S", Region: "r", BaseURL: "https://s3.us-east-2.amazonaws.com/backup"},
 	}
 	p := newMultiProcessor(dests, h.dataDir, "*.gz", h.binary, notifier)
 
@@ -396,7 +399,7 @@ func TestWebhookSkipsBatchWithoutSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	bodies, _ := rec.take()
-	wantBody := `[{"sha1":"` + sha1Hex("12345") + `","s3":["s3://primary/logs/a.gz","s3://backup/a.gz"],"file":[]}]`
+	wantBody := `[{"sha1":"` + sha1Hex("12345") + `","s3":["https://primary.s3.amazonaws.com/logs/a.gz","https://s3.us-east-2.amazonaws.com/backup/a.gz"],"file":[]}]`
 	if len(bodies) != 1 || bodies[0] != wantBody {
 		t.Fatalf("payload = %q, want %s", bodies, wantBody)
 	}
@@ -429,6 +432,78 @@ func TestWebhookWithoutToken(t *testing.T) {
 	}
 	if _, headers := rec.take(); headers[0].Get("Authorization") != "" {
 		t.Fatalf("unexpected Authorization header %q", headers[0].Get("Authorization"))
+	}
+}
+
+func TestDestinationObjectURL(t *testing.T) {
+	tests := []struct {
+		bucketPath, baseURL, relKey, want string
+	}{
+		{"s3://my-bucket", "https://my-bucket.s3.amazonaws.com", "auctions/2026-10-28/12/file.gz", "https://my-bucket.s3.amazonaws.com/auctions/2026-10-28/12/file.gz"},
+		{"s3://my-bucket/", "https://my-bucket.s3.amazonaws.com", "a.gz", "https://my-bucket.s3.amazonaws.com/a.gz"},
+		{"s3://bold-exchange-logs/events/", "https://cdn.example.com", "2026-10-28/h1/x.gz", "https://cdn.example.com/events/2026-10-28/h1/x.gz"},
+		{"s3://legacy/path", "https://s3.us-east-2.amazonaws.com/legacy", "a.gz", "https://s3.us-east-2.amazonaws.com/legacy/path/a.gz"},
+		{"s3://b/", "https://b.example.com", "sub/sp ace+it's#1?.gz", "https://b.example.com/sub/sp%20ace%2Bit%27s%231%3F.gz"},
+	}
+	for _, tt := range tests {
+		d := Destination{BucketPath: tt.bucketPath, BaseURL: tt.baseURL}
+		if got := d.objectURL(tt.relKey); got != tt.want {
+			t.Errorf("objectURL(%q) with %q = %q, want %q", tt.relKey, tt.bucketPath, got, tt.want)
+		}
+	}
+}
+
+func TestLoadDestinationsBaseURL(t *testing.T) {
+	getenv, environ := envMap(map[string]string{
+		"DEST_1_S3_BUCKET_PATH": "s3://a/",
+		"DEST_1_AWS_CREDS_FILE": "/c",
+		"DEST_1_S3_BASE_URL":    "https://a.s3.amazonaws.com/",
+		"DEST_2_FILE_PATH":      t.TempDir(),
+	})
+	legacy := legacyDest("s3://legacy/", "/c")
+	legacy.BaseURL = "https://legacy.s3.amazonaws.com"
+
+	dests, err := loadDestinations(legacy, getenv, environ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dests[0].BaseURL != "https://legacy.s3.amazonaws.com" || dests[1].BaseURL != "https://a.s3.amazonaws.com" {
+		t.Fatalf("unexpected base URLs %+v", dests)
+	}
+	if err := requireBaseURLs(dests); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, bad := range []string{"s3://a/", "a.s3.amazonaws.com", "https://a.example.com/?x=1"} {
+		getenv, environ := envMap(map[string]string{"DEST_1_S3_BUCKET_PATH": "s3://a/", "DEST_1_AWS_CREDS_FILE": "/c", "DEST_1_S3_BASE_URL": bad})
+		if _, err := loadDestinations(legacyDest("", ""), getenv, environ); err == nil || !strings.Contains(err.Error(), "DEST_1_S3_BASE_URL") {
+			t.Errorf("base URL %q: got %v", bad, err)
+		}
+	}
+	bad := legacyDest("s3://legacy/", "/c")
+	bad.BaseURL = "legacy.example.com"
+	getenv, environ = envMap(nil)
+	if _, err := loadDestinations(bad, getenv, environ); err == nil || !strings.Contains(err.Error(), "S3_BASE_URL") {
+		t.Errorf("legacy base URL: got %v", err)
+	}
+}
+
+func TestRequireBaseURLs(t *testing.T) {
+	if err := requireBaseURLs([]Destination{legacyDest("s3://a/", "/c")}); err == nil || !strings.Contains(err.Error(), "S3_BASE_URL env var") {
+		t.Errorf("legacy: got %v", err)
+	}
+	getenv, environ := envMap(map[string]string{
+		"DEST_1_FILE_PATH":      t.TempDir(),
+		"DEST_2_NAME":           "r2",
+		"DEST_2_S3_BUCKET_PATH": "s3://a/",
+		"DEST_2_AWS_CREDS_FILE": "/c",
+	})
+	dests, err := loadDestinations(legacyDest("", ""), getenv, environ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requireBaseURLs(dests); err == nil || !strings.Contains(err.Error(), `destination "r2": DEST_2_S3_BASE_URL is required`) {
+		t.Errorf("indexed: got %v", err)
 	}
 }
 
