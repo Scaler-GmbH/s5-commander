@@ -59,20 +59,25 @@ type multiProcessor struct {
 	folderPrefix string
 	pathSuffix   string
 	s5cmdBinary  string
+	notifier     *webhookNotifier
 
 	// delivered maps a local source path to the destinations that confirmed it.
 	delivered   map[string]map[string]bool
 	lastSuccess map[string]int64
+	// sha1 caches the SHA-1 of local source files that are still on disk.
+	sha1 map[string]string
 }
 
-func newMultiProcessor(dests []Destination, folderPrefix, pathSuffix, s5cmdBinary string) *multiProcessor {
+func newMultiProcessor(dests []Destination, folderPrefix, pathSuffix, s5cmdBinary string, notifier *webhookNotifier) *multiProcessor {
 	return &multiProcessor{
 		dests:        dests,
 		folderPrefix: folderPrefix,
 		pathSuffix:   pathSuffix,
 		s5cmdBinary:  s5cmdBinary,
+		notifier:     notifier,
 		delivered:    map[string]map[string]bool{},
 		lastSuccess:  map[string]int64{},
+		sha1:         map[string]string{},
 	}
 }
 
@@ -101,34 +106,25 @@ func (p *multiProcessor) process() (Summary, error) {
 			delete(p.delivered, src)
 		}
 	}
+	for src := range p.sha1 {
+		if !current[src] {
+			delete(p.sha1, src)
+		}
+	}
 	if len(files) == 0 {
 		return summary, nil
 	}
 
+	// Local copies are faster, so every file destination finishes before any
+	// S3 upload starts.
 	results := make([]destResult, len(p.dests))
-	var wg sync.WaitGroup
-	for i, d := range p.dests {
-		var pending []discoveredFile
-		for _, f := range files {
-			if !p.delivered[f.source][d.Name] {
-				pending = append(pending, f)
-			}
-		}
-		if len(pending) == 0 {
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i] = p.upload(jobID.String(), d, pending)
-		}()
-	}
-	wg.Wait()
+	p.runDestinations(jobID.String(), files, results, true)
+	p.runDestinations(jobID.String(), files, results, false)
 
 	for i, d := range p.dests {
 		r := results[i]
 		if r.err != nil {
-			log.Printf("Error uploading to destination %q for job %s: %v", d.Name, jobID, r.err)
+			log.Printf("Error copying to destination %q for job %s: %v", d.Name, jobID, r.err)
 		}
 		ds := summary.PerDest[d.Name]
 		ds.FilesFailed = r.attempted - len(r.succeeded)
@@ -140,9 +136,17 @@ func (p *multiProcessor) process() (Summary, error) {
 			ds.FilesTransferred++
 			ds.TotalBytes += size
 		}
+		for src, sum := range r.sha1 {
+			p.sha1[src] = sum
+		}
 		if len(r.succeeded) > 0 {
 			p.lastSuccess[d.Name] = time.Now().Unix()
 		}
+	}
+
+	var entries []webhookEntry
+	if p.notifier != nil {
+		entries = p.batchEntries(files, results)
 	}
 
 	for _, f := range files {
@@ -159,10 +163,81 @@ func (p *multiProcessor) process() (Summary, error) {
 		} else {
 			summary.FilesDeleted++
 			delete(p.delivered, f.source)
+			delete(p.sha1, f.source)
+		}
+	}
+
+	if len(entries) > 0 {
+		if err := p.notifier.send(entries); err != nil {
+			log.Printf("Error sending webhook for job %s: %v", jobID, err)
 		}
 	}
 
 	return summary, nil
+}
+
+// runDestinations copies every file a destination has not yet confirmed, for
+// either all file destinations or all S3 destinations, in parallel.
+func (p *multiProcessor) runDestinations(jobID string, files []discoveredFile, results []destResult, fileDests bool) {
+	var wg sync.WaitGroup
+	for i, d := range p.dests {
+		if d.isFile() != fileDests {
+			continue
+		}
+		var pending []discoveredFile
+		for _, f := range files {
+			if !p.delivered[f.source][d.Name] {
+				pending = append(pending, f)
+			}
+		}
+		if len(pending) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if fileDests {
+				results[i] = p.copyToDir(d, pending)
+			} else {
+				results[i] = p.upload(jobID, d, pending)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// batchEntries lists, for every file copied anywhere in this run, the
+// locations it was copied to in this run.
+func (p *multiProcessor) batchEntries(files []discoveredFile, results []destResult) []webhookEntry {
+	var entries []webhookEntry
+	for _, f := range files {
+		entry := webhookEntry{S3: []string{}, File: []string{}}
+		for i, d := range p.dests {
+			if _, ok := results[i].succeeded[f.source]; !ok {
+				continue
+			}
+			if d.isFile() {
+				entry.File = append(entry.File, d.location(f.relKey))
+			} else {
+				entry.S3 = append(entry.S3, d.location(f.relKey))
+			}
+		}
+		if len(entry.S3) == 0 && len(entry.File) == 0 {
+			continue
+		}
+		sum, ok := p.sha1[f.source]
+		if !ok {
+			var err error
+			if sum, _, err = hashFile(f.source); err != nil {
+				log.Printf("Not reporting %s to webhook: %v", f.source, err)
+				continue
+			}
+			p.sha1[f.source] = sum
+		}
+		entry.SHA1 = sum
+		entries = append(entries, entry)
+	}
+	return entries
 }
 
 func (p *multiProcessor) deliveredEverywhere(src string) bool {
@@ -174,7 +249,7 @@ func (p *multiProcessor) deliveredEverywhere(src string) bool {
 	return true
 }
 
-// discover runs a dry-run copy against the first destination to obtain the
+// discover runs a dry-run copy against the first S3 destination to obtain the
 // matching files and the key layout s5cmd would use for them.
 func (p *multiProcessor) discover(jobID string) ([]discoveredFile, error) {
 	pathSuffix := p.pathSuffix
@@ -182,7 +257,10 @@ func (p *multiProcessor) discover(jobID string) ([]discoveredFile, error) {
 		pathSuffix = pathSuffix[1:]
 	}
 	srcPath := filepath.Join(p.folderPrefix, pathSuffix)
-	primary := p.dests[0]
+	primary, ok := firstS3(p.dests)
+	if !ok {
+		return nil, errors.New("no S3 destination configured")
+	}
 
 	outFile := fmt.Sprintf("%s-discover.json", jobID)
 	defer os.Remove(outFile)
@@ -225,7 +303,38 @@ func (p *multiProcessor) discover(jobID string) ([]discoveredFile, error) {
 type destResult struct {
 	attempted int
 	succeeded map[string]int64
-	err       error
+	// sha1 holds the verified SHA-1 of sources copied to a file destination.
+	sha1 map[string]string
+	err  error
+}
+
+// copyToDir copies files to a local directory destination, keeping the same
+// relative layout as the S3 object keys.
+func (p *multiProcessor) copyToDir(d Destination, files []discoveredFile) destResult {
+	res := destResult{attempted: len(files), succeeded: map[string]int64{}, sha1: map[string]string{}}
+	var firstErr error
+	for _, f := range files {
+		rel := filepath.FromSlash(f.relKey)
+		if !filepath.IsLocal(rel) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("refusing to copy %s outside %s: key %q", f.source, d.FilePath, f.relKey)
+			}
+			continue
+		}
+		sum, size, err := copyFileVerified(f.source, d.location(f.relKey))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		res.succeeded[f.source] = size
+		res.sha1[f.source] = sum
+	}
+	if firstErr != nil {
+		res.err = fmt.Errorf("%d of %d copies failed, first error: %w", res.attempted-len(res.succeeded), res.attempted, firstErr)
+	}
+	return res
 }
 
 // upload copies files to a single destination using an s5cmd command file.

@@ -103,7 +103,7 @@ func TestLoadDestinationsValidation(t *testing.T) {
 			name:    "gap in numbering",
 			legacy:  legacyDest("", ""),
 			env:     map[string]string{"DEST_1_S3_BUCKET_PATH": "s3://a/", "DEST_1_AWS_CREDS_FILE": "/c", "DEST_3_S3_BUCKET_PATH": "s3://b/"},
-			wantErr: "DEST_3_* variables are set but DEST_2_S3_BUCKET_PATH is missing",
+			wantErr: "DEST_3_* variables are set but DEST_2_S3_BUCKET_PATH or DEST_2_FILE_PATH is missing",
 		},
 		{
 			name:    "missing credentials",
@@ -193,6 +193,9 @@ func TestDestinationGlobalArgs(t *testing.T) {
 //     failing every copy when AWS_ACCESS_KEY_ID equals FAKE_FAIL_KEY.
 //
 // Every copy attempt is appended to FAKE_S5CMD_LOG as "key|session|src|dst".
+// When FAKE_LOCAL_DIR is set, each attempt also appends "dst|present" to
+// FAKE_LOCAL_LOG, where present is 1 if FAKE_LOCAL_DIR already holds the file
+// under the key relative to FAKE_DST_PREFIX.
 const fakeMultiS5cmdScript = `#!/bin/sh
 for a in "$@"; do
   if [ "$a" = "--dry-run" ]; then
@@ -206,6 +209,11 @@ while IFS= read -r line; do
   eval "set -- $line"
   src="$3"; dst="$4"
   printf '%s|%s|%s|%s\n' "$AWS_ACCESS_KEY_ID" "$AWS_SESSION_TOKEN" "$src" "$dst" >> "$FAKE_S5CMD_LOG"
+  if [ -n "$FAKE_LOCAL_DIR" ]; then
+    present=0
+    if [ -f "$FAKE_LOCAL_DIR/${dst#"$FAKE_DST_PREFIX"}" ]; then present=1; fi
+    printf '%s|%s\n' "$dst" "$present" >> "$FAKE_LOCAL_LOG"
+  fi
   if [ -n "$FAKE_FAIL_KEY" ] && [ "$AWS_ACCESS_KEY_ID" = "$FAKE_FAIL_KEY" ]; then
     printf '{"operation":"cp","command":"cp","error":"access denied"}\n'
     status=1
@@ -239,6 +247,7 @@ func newMultiHarness(t *testing.T, names ...string) *multiHarness {
 	t.Setenv("FAKE_S5CMD_LOG", h.logFile)
 	t.Setenv("FAKE_S5CMD_EXIT", "0")
 	t.Setenv("FAKE_FAIL_KEY", "")
+	t.Setenv("FAKE_LOCAL_DIR", "")
 	t.Setenv("AWS_SESSION_TOKEN", "LEAK")
 
 	var discovery []string
@@ -285,7 +294,7 @@ func twoDestinations() []Destination {
 
 func TestMultiDeletesOnlyAfterAllDestinationsConfirm(t *testing.T) {
 	h := newMultiHarness(t, "a.gz", "sub/sp ace.gz", "it's.gz")
-	p := newMultiProcessor(twoDestinations(), h.dataDir, "**/*.gz", h.binary)
+	p := newMultiProcessor(twoDestinations(), h.dataDir, "**/*.gz", h.binary, nil)
 
 	t.Setenv("FAKE_FAIL_KEY", "KB")
 	summary, err := p.process()
@@ -349,7 +358,7 @@ func TestMultiDeletesOnlyAfterAllDestinationsConfirm(t *testing.T) {
 
 func TestMultiPrunesVanishedFiles(t *testing.T) {
 	h := newMultiHarness(t, "a.gz")
-	p := newMultiProcessor(twoDestinations(), h.dataDir, "*.gz", h.binary)
+	p := newMultiProcessor(twoDestinations(), h.dataDir, "*.gz", h.binary, nil)
 
 	t.Setenv("FAKE_FAIL_KEY", "KB")
 	if _, err := p.process(); err != nil {
@@ -375,7 +384,7 @@ func TestMultiNoMatchIsQuiet(t *testing.T) {
 	t.Setenv("FAKE_S5CMD_OUTPUT", out)
 	t.Setenv("FAKE_S5CMD_EXIT", "1")
 
-	p := newMultiProcessor(twoDestinations(), h.dataDir, "*.gz", h.binary)
+	p := newMultiProcessor(twoDestinations(), h.dataDir, "*.gz", h.binary, nil)
 	summary, err := p.process()
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -392,7 +401,7 @@ func TestMultiDiscoveryFailureIsReported(t *testing.T) {
 	t.Setenv("FAKE_S5CMD_OUTPUT", out)
 	t.Setenv("FAKE_S5CMD_EXIT", "1")
 
-	p := newMultiProcessor(twoDestinations(), h.dataDir, "*.gz", h.binary)
+	p := newMultiProcessor(twoDestinations(), h.dataDir, "*.gz", h.binary, nil)
 	if _, err := p.process(); err == nil {
 		t.Fatal("expected discovery error")
 	}

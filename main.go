@@ -103,6 +103,11 @@ func main() {
 	awsEndpointURL := flag.String("aws-endpoint-url", "", "Custom AWS endpoint (env: AWS_ENDPOINT_URL)")
 	awsProfile := flag.String("aws-profile", "default", "AWS profile to use from credentials file (env: AWS_PROFILE)")
 
+	// webhook flags
+	webhookURL := flag.String("webhook-url", "", "HTTP(S) endpoint that receives a JSON summary after each batch (env: WEBHOOK_URL)")
+	webhookBearerToken := flag.String("webhook-bearer-token", "", "Bearer token sent in the Authorization header of webhook requests (env: WEBHOOK_BEARER_TOKEN)")
+	webhookTimeout := flag.Duration("webhook-timeout", 10*time.Second, "Timeout for each webhook request (env: WEBHOOK_TIMEOUT)")
+
 	flag.Parse()
 
 	// Get actual values from environment variables with flag fallbacks
@@ -118,6 +123,10 @@ func main() {
 	actualAwsCredsFile := getEnvOrFlag("AWS_CREDS_FILE", *awsCredsFile)
 	actualAwsProfile := getEnvOrFlag("AWS_PROFILE", *awsProfile)
 	actualS3BucketPath := getEnvOrFlag("S3_BUCKET_PATH", *s3BucketPath)
+
+	actualWebhookURL := getEnvOrFlag("WEBHOOK_URL", *webhookURL)
+	actualWebhookBearerToken := getEnvOrFlag("WEBHOOK_BEARER_TOKEN", *webhookBearerToken)
+	actualWebhookTimeout := getEnvOrFlagDuration("WEBHOOK_TIMEOUT", *webhookTimeout)
 
 	// Check for AWS credentials in environment variables
 	awsAccessKeyID := os.Getenv("AWS_ACCESS_KEY_ID")
@@ -143,7 +152,16 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	legacyMode := len(dests) == 1 && dests[0].Legacy
+	var notifier *webhookNotifier
+	if actualWebhookURL != "" {
+		notifier, err = newWebhookNotifier(actualWebhookURL, actualWebhookBearerToken, actualWebhookTimeout)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	// The webhook needs per-file results, which only the multi-destination
+	// processor tracks.
+	legacyMode := len(dests) == 1 && dests[0].Legacy && notifier == nil
 
 	// Log startup configuration
 	if legacyMode {
@@ -154,18 +172,23 @@ func main() {
 		}
 	} else {
 		for _, d := range dests {
-			if d.hasEnvCreds() {
+			if d.isFile() {
+				log.Printf("Destination %q: %s (local directory)", d.Name, d.FilePath)
+			} else if d.hasEnvCreds() {
 				log.Printf("Destination %q: %s (credentials from environment variables, region: %s)", d.Name, d.BucketPath, d.Region)
 			} else {
 				log.Printf("Destination %q: %s (credentials from file: %s, profile: %s)", d.Name, d.BucketPath, d.CredsFile, d.Profile)
 			}
 		}
 	}
+	if notifier != nil {
+		log.Printf("Sending batch webhooks to %s (bearer token configured: %t)", actualWebhookURL, actualWebhookBearerToken != "")
+	}
 	log.Printf("Using s5cmd binary: %s", actualS5cmdBinary)
 
 	var multi *multiProcessor
 	if !legacyMode {
-		multi = newMultiProcessor(dests, actualFolderPrefix, actualPathSuffix, actualS5cmdBinary)
+		multi = newMultiProcessor(dests, actualFolderPrefix, actualPathSuffix, actualS5cmdBinary, notifier)
 	}
 
 	// Set up graceful shutdown
