@@ -107,6 +107,7 @@ func main() {
 	webhookURL := flag.String("webhook-url", "", "HTTP(S) endpoint that receives a JSON summary after each batch (env: WEBHOOK_URL)")
 	webhookBearerToken := flag.String("webhook-bearer-token", "", "Bearer token sent in the Authorization header of webhook requests (env: WEBHOOK_BEARER_TOKEN)")
 	webhookTimeout := flag.Duration("webhook-timeout", 10*time.Second, "Timeout for each webhook request (env: WEBHOOK_TIMEOUT)")
+	s3BaseURL := flag.String("s3-base-url", "", "Public HTTP(S) URL of the S3 bucket, used for webhook object URLs (env: S3_BASE_URL)")
 
 	flag.Parse()
 
@@ -127,6 +128,7 @@ func main() {
 	actualWebhookURL := getEnvOrFlag("WEBHOOK_URL", *webhookURL)
 	actualWebhookBearerToken := getEnvOrFlag("WEBHOOK_BEARER_TOKEN", *webhookBearerToken)
 	actualWebhookTimeout := getEnvOrFlagDuration("WEBHOOK_TIMEOUT", *webhookTimeout)
+	actualS3BaseURL := getEnvOrFlag("S3_BASE_URL", *s3BaseURL)
 
 	// Check for AWS credentials in environment variables
 	awsAccessKeyID := os.Getenv("AWS_ACCESS_KEY_ID")
@@ -140,6 +142,7 @@ func main() {
 		EndpointURL: actualAwsEndpointURL,
 		CredsFile:   actualAwsCredsFile,
 		Profile:     actualAwsProfile,
+		BaseURL:     actualS3BaseURL,
 		Legacy:      true,
 	}
 	if hasAwsEnvCreds {
@@ -156,6 +159,9 @@ func main() {
 	if actualWebhookURL != "" {
 		notifier, err = newWebhookNotifier(actualWebhookURL, actualWebhookBearerToken, actualWebhookTimeout)
 		if err != nil {
+			log.Fatal(err)
+		}
+		if err := requireBaseURLs(dests); err != nil {
 			log.Fatal(err)
 		}
 	}

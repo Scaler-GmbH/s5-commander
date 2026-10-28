@@ -217,9 +217,9 @@ func (p *multiProcessor) batchEntries(files []discoveredFile, results []destResu
 				continue
 			}
 			if d.isFile() {
-				entry.File = append(entry.File, d.location(f.relKey))
+				entry.File = append(entry.File, f.relKey)
 			} else {
-				entry.S3 = append(entry.S3, d.location(f.relKey))
+				entry.S3 = append(entry.S3, d.objectURL(f.relKey))
 			}
 		}
 		if len(entry.S3) == 0 && len(entry.File) == 0 {
