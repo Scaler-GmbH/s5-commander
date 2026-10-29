@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,10 +19,9 @@ type webhookEntry struct {
 
 // webhookNotifier POSTs batch results as JSON to a configured endpoint.
 type webhookNotifier struct {
-	url     string
-	token   string
-	client  *http.Client
-	backoff []time.Duration
+	url    string
+	token  string
+	client *http.Client
 }
 
 func newWebhookNotifier(rawURL, token string, timeout time.Duration) (*webhookNotifier, error) {
@@ -31,33 +30,15 @@ func newWebhookNotifier(rawURL, token string, timeout time.Duration) (*webhookNo
 		return nil, fmt.Errorf("webhook-url (or WEBHOOK_URL env var) must be an http or https URL, got %q", rawURL)
 	}
 	return &webhookNotifier{
-		url:     rawURL,
-		token:   token,
-		client:  &http.Client{Timeout: timeout},
-		backoff: []time.Duration{1 * time.Second, 2 * time.Second},
+		url:    rawURL,
+		token:  token,
+		client: &http.Client{Timeout: timeout},
 	}, nil
 }
 
-// send delivers entries, retrying after each delay in backoff before giving up.
-func (w *webhookNotifier) send(entries []webhookEntry) error {
-	body, err := json.Marshal(entries)
-	if err != nil {
-		return fmt.Errorf("error encoding webhook payload: %w", err)
-	}
-	for attempt := 0; ; attempt++ {
-		err = w.post(body)
-		if err == nil {
-			return nil
-		}
-		if attempt >= len(w.backoff) {
-			return fmt.Errorf("giving up after %d attempts: %w", attempt+1, err)
-		}
-		time.Sleep(w.backoff[attempt])
-	}
-}
-
-func (w *webhookNotifier) post(body []byte) error {
-	req, err := http.NewRequest(http.MethodPost, w.url, bytes.NewReader(body))
+// post sends one JSON-encoded batch. Any non-2xx response is an error.
+func (w *webhookNotifier) post(ctx context.Context, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
