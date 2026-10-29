@@ -195,11 +195,38 @@ With `S3_BUCKET_PATH=s3://my-aws-bucket/logs/`, `S3_BASE_URL=https://my-aws-buck
 ```
 
 - A destination that failed for a file is left out of that file's `s3` or `file` list. `s3` and `file` are always arrays, possibly empty.
-- When a failed destination succeeds on a later run, that later batch reports the file again with only the newly copied location. Every successful copy is reported exactly once.
-- Files that were not copied anywhere in a batch are not included, and no request is sent for a batch without any successful copy.
-- Any 2xx response counts as success. Failed requests are retried twice (after 1s and 2s), then logged and dropped. The webhook never delays or prevents deleting source files.
+- When a failed destination succeeds on a later run, that later batch reports the file again with only the newly copied location. Every successful copy appears in exactly one batch.
+- Files that were not copied anywhere in a batch are not included, and no batch is produced for a run without any successful copy.
 
 Setting `WEBHOOK_URL` with only the single `S3_BUCKET_PATH` destination switches to the multi-destination processing described below, because per-file results are needed.
+
+#### Delivery and the Retry Queue
+
+Batches are never dropped. Each batch is written to a queue file on disk, and synced, before any source file of that run is deleted. A background sender then delivers the queue:
+
+- One batch per POST, oldest first, exactly as it was produced. A batch that cannot be delivered holds back the ones behind it, so the order is preserved.
+- Any 2xx response counts as delivered. Anything else (connection errors, timeouts, 4xx and 5xx responses) is retried with exponential backoff: 1s, 2s, 4s and so on, up to `WEBHOOK_MAX_BACKOFF`. Retries continue until the batch is delivered, including after restarts.
+- Delivery is at-least-once: if the service stops between a successful POST and recording it, that one batch is sent again after the restart. Receivers can de-duplicate using `sha1` plus the location.
+- Webhook delivery runs independently of file processing, so a slow or unavailable endpoint does not delay offloading.
+- If the queue file cannot be written (for example, the disk is full), the batch is kept in memory and source files are not deleted until it has been queued.
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--webhook-queue-file` | `WEBHOOK_QUEUE_FILE` | see below | File holding undelivered batches |
+| `--webhook-max-backoff` | `WEBHOOK_MAX_BACKOFF` | `5m` | Longest delay between delivery attempts (at least `1s`) |
+
+Without `WEBHOOK_QUEUE_FILE`, the queue is stored at `$STATE_DIRECTORY/webhook-queue` when running under systemd with `StateDirectory=` set, and at `/var/lib/s5-commander/webhook-queue` otherwise. Missing directories are created. If the location is not writable, the service refuses to start; set `WEBHOOK_QUEUE_FILE` or grant access. With systemd, a state directory owned by the service user is the simplest option:
+
+```ini
+[Service]
+StateDirectory=s5-commander
+```
+
+The file is locked while the service runs, so two instances cannot share it. It is not meant to be edited: it starts with a header recording delivery progress, followed by one batch per line. It shrinks back to just the header whenever the queue is empty, and is compacted during long outages.
+
+**Clearing the backlog:** if queued batches should be discarded (for example, the endpoint has moved and will never accept them), stop the service, delete the queue file, and start the service again. This is the only way batches are ever removed without being delivered.
+
+The number of queued batches is logged at startup and shutdown, and sent to Netdata as `s5commander.webhook.queue_pending` after each run.
 
 ### S5cmd Binary Configuration
 
@@ -267,6 +294,8 @@ With a single destination, only the metrics above are sent. When multiple destin
 - `s5commander.dest.<name>.last_success`: Unix timestamp of the last successful upload to this destination
 - `s5commander.dest.<name>.session.final_*`: Final accumulated per-destination totals (sent on shutdown)
 
+When the webhook is enabled, `s5commander.webhook.queue_pending` reports the number of batches waiting to be delivered.
+
 ### Flexible Configuration
 
 - Command line flags take precedence over environment variables
@@ -289,7 +318,7 @@ With multiple destinations (or a webhook), each run works as follows instead:
 1. **Discovers files**: `s5cmd --dry-run cp` against the first S3 destination lists the matching files and their object keys, without uploading anything.
 2. **Copies to local directories first**: For each local directory destination, every file that destination has not yet confirmed is copied under the same key, verified by SHA-1 and renamed into place.
 3. **Uploads in parallel**: For each S3 destination, an `s5cmd run` command file copies every file that destination has not yet confirmed, using that destination's own endpoint and credentials.
-4. **Deletes only fully delivered files**: A local file is deleted only after every destination has confirmed it. Files with partial delivery stay on disk and are retried on the next run.
-5. **Sends the webhook**: If configured, the locations each file was copied to in this run are POSTed to the webhook.
+4. **Queues the webhook batch**: If configured, the locations each file was copied to in this run are written to the on-disk webhook queue. A background sender POSTs queued batches to the webhook, retrying until each one is delivered.
+5. **Deletes only fully delivered files**: A local file is deleted only after every destination has confirmed it (and, with a webhook, after its batch is queued). Files with partial delivery stay on disk and are retried on the next run.
 
 The application is designed to be a long-running service that continuously offloads files as they are generated, with proper monitoring and graceful shutdown capabilities. 

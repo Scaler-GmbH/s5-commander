@@ -108,6 +108,8 @@ func main() {
 	webhookBearerToken := flag.String("webhook-bearer-token", "", "Bearer token sent in the Authorization header of webhook requests (env: WEBHOOK_BEARER_TOKEN)")
 	webhookTimeout := flag.Duration("webhook-timeout", 10*time.Second, "Timeout for each webhook request (env: WEBHOOK_TIMEOUT)")
 	s3BaseURL := flag.String("s3-base-url", "", "Public HTTP(S) URL of the S3 bucket, used for webhook object URLs (env: S3_BASE_URL)")
+	webhookQueueFile := flag.String("webhook-queue-file", "", "File that holds undelivered webhook batches (default: $STATE_DIRECTORY/webhook-queue or "+DefaultWebhookQueueFile+") (env: WEBHOOK_QUEUE_FILE)")
+	webhookMaxBackoff := flag.Duration("webhook-max-backoff", 5*time.Minute, "Maximum delay between webhook delivery retries (env: WEBHOOK_MAX_BACKOFF)")
 
 	flag.Parse()
 
@@ -129,6 +131,8 @@ func main() {
 	actualWebhookBearerToken := getEnvOrFlag("WEBHOOK_BEARER_TOKEN", *webhookBearerToken)
 	actualWebhookTimeout := getEnvOrFlagDuration("WEBHOOK_TIMEOUT", *webhookTimeout)
 	actualS3BaseURL := getEnvOrFlag("S3_BASE_URL", *s3BaseURL)
+	actualWebhookQueueFile := webhookQueuePath(getEnvOrFlag("WEBHOOK_QUEUE_FILE", *webhookQueueFile), os.Getenv)
+	actualWebhookMaxBackoff := getEnvOrFlagDuration("WEBHOOK_MAX_BACKOFF", *webhookMaxBackoff)
 
 	// Check for AWS credentials in environment variables
 	awsAccessKeyID := os.Getenv("AWS_ACCESS_KEY_ID")
@@ -156,6 +160,7 @@ func main() {
 		log.Fatal(err)
 	}
 	var notifier *webhookNotifier
+	var queue *webhookQueue
 	if actualWebhookURL != "" {
 		notifier, err = newWebhookNotifier(actualWebhookURL, actualWebhookBearerToken, actualWebhookTimeout)
 		if err != nil {
@@ -164,6 +169,14 @@ func main() {
 		if err := requireBaseURLs(dests); err != nil {
 			log.Fatal(err)
 		}
+		if actualWebhookMaxBackoff < time.Second {
+			log.Fatal("webhook-max-backoff (or WEBHOOK_MAX_BACKOFF env var) must be at least 1s")
+		}
+		queue, err = openWebhookQueue(actualWebhookQueueFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer queue.close()
 	}
 	// The webhook needs per-file results, which only the multi-destination
 	// processor tracks.
@@ -189,17 +202,27 @@ func main() {
 	}
 	if notifier != nil {
 		log.Printf("Sending batch webhooks to %s (bearer token configured: %t)", actualWebhookURL, actualWebhookBearerToken != "")
+		log.Printf("Webhook queue: %s (%d batches pending, max retry delay %v)", actualWebhookQueueFile, queue.pendingBatches(), actualWebhookMaxBackoff)
 	}
 	log.Printf("Using s5cmd binary: %s", actualS5cmdBinary)
 
 	var multi *multiProcessor
 	if !legacyMode {
-		multi = newMultiProcessor(dests, actualFolderPrefix, actualPathSuffix, actualS5cmdBinary, notifier)
+		multi = newMultiProcessor(dests, actualFolderPrefix, actualPathSuffix, actualS5cmdBinary, queue)
 	}
 
 	// Set up graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	var senderDone chan struct{}
+	if queue != nil {
+		senderDone = make(chan struct{})
+		go func() {
+			defer close(senderDone)
+			queue.run(ctx, notifier, time.Second, actualWebhookMaxBackoff)
+		}()
+	}
 
 	// Set up signal handling
 	sigChan := make(chan os.Signal, 1)
@@ -260,6 +283,11 @@ func main() {
 				}
 			}
 
+			if senderDone != nil {
+				<-senderDone
+				log.Printf("Webhook queue closed with %d batches pending", queue.pendingBatches())
+			}
+
 			log.Println("s5-commander shutdown complete")
 			return
 
@@ -292,6 +320,11 @@ func main() {
 				if multi != nil {
 					if err := sendDestinationMetrics(actualNetdataAddress, dests, &summary, multi.lastSuccess); err != nil {
 						log.Printf("Error sending destination metrics to Netdata: %v", err)
+					}
+				}
+				if queue != nil {
+					if err := sendMetrics(actualNetdataAddress, webhookQueueMetrics(queue.pendingBatches())); err != nil {
+						log.Printf("Error sending webhook queue metrics to Netdata: %v", err)
 					}
 				}
 			}

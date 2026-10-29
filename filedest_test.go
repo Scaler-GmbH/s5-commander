@@ -4,14 +4,10 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -285,46 +281,6 @@ func TestMultiFileDestinationFailureKeepsSource(t *testing.T) {
 	}
 }
 
-type webhookRecorder struct {
-	mu       sync.Mutex
-	bodies   []string
-	headers  []http.Header
-	statuses []int
-}
-
-func newWebhookServer(t *testing.T, statuses ...int) (*webhookRecorder, *webhookNotifier) {
-	t.Helper()
-	rec := &webhookRecorder{statuses: statuses}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		rec.mu.Lock()
-		defer rec.mu.Unlock()
-		rec.bodies = append(rec.bodies, string(body))
-		rec.headers = append(rec.headers, r.Header.Clone())
-		status := http.StatusOK
-		if len(rec.statuses) > 0 {
-			status, rec.statuses = rec.statuses[0], rec.statuses[1:]
-		}
-		w.WriteHeader(status)
-	}))
-	t.Cleanup(srv.Close)
-
-	n, err := newWebhookNotifier(srv.URL, "secret-token", 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	n.backoff = []time.Duration{time.Millisecond, time.Millisecond}
-	return rec, n
-}
-
-func (r *webhookRecorder) take() ([]string, []http.Header) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	bodies, headers := r.bodies, r.headers
-	r.bodies, r.headers = nil, nil
-	return bodies, headers
-}
-
 func decodeEntries(t *testing.T, body string) []webhookEntry {
 	t.Helper()
 	var entries []webhookEntry
@@ -337,22 +293,16 @@ func decodeEntries(t *testing.T, body string) []webhookEntry {
 func TestWebhookReportsIncrementalBatches(t *testing.T) {
 	h := newMultiHarness(t, "sub/a.gz")
 	out := t.TempDir()
-	rec, notifier := newWebhookServer(t)
-	p := newMultiProcessor(fileAndS3Destinations(out), h.dataDir, "**/*.gz", h.binary, notifier)
+	q := newTestQueue(t)
+	p := newMultiProcessor(fileAndS3Destinations(out), h.dataDir, "**/*.gz", h.binary, q)
 
 	t.Setenv("FAKE_FAIL_KEY", "KB")
 	if _, err := p.process(); err != nil {
 		t.Fatal(err)
 	}
-	bodies, headers := rec.take()
+	bodies := drain(t, q)
 	if len(bodies) != 1 {
-		t.Fatalf("expected one webhook request, got %q", bodies)
-	}
-	if got := headers[0].Get("Authorization"); got != "Bearer secret-token" {
-		t.Errorf("Authorization = %q", got)
-	}
-	if got := headers[0].Get("Content-Type"); got != "application/json" {
-		t.Errorf("Content-Type = %q", got)
+		t.Fatalf("expected one queued batch, got %q", bodies)
 	}
 	want := []webhookEntry{{
 		SHA1: sha1Hex("12345"),
@@ -367,9 +317,9 @@ func TestWebhookReportsIncrementalBatches(t *testing.T) {
 	if _, err := p.process(); err != nil {
 		t.Fatal(err)
 	}
-	bodies, _ = rec.take()
+	bodies = drain(t, q)
 	if len(bodies) != 1 {
-		t.Fatalf("expected one webhook request, got %q", bodies)
+		t.Fatalf("expected one queued batch, got %q", bodies)
 	}
 	wantBody := `[{"sha1":"` + sha1Hex("12345") + `","s3":["https://backup.example.com/sub/a.gz"],"file":[]}]`
 	if bodies[0] != wantBody {
@@ -379,59 +329,73 @@ func TestWebhookReportsIncrementalBatches(t *testing.T) {
 
 func TestWebhookSkipsBatchWithoutSuccess(t *testing.T) {
 	h := newMultiHarness(t, "a.gz")
-	rec, notifier := newWebhookServer(t)
+	q := newTestQueue(t)
 	dests := []Destination{
 		{Name: "a", BucketPath: "s3://primary/logs/", AccessKeyID: "KX", SecretAccessKey: "S", Region: "r", BaseURL: "https://primary.s3.amazonaws.com"},
 		{Name: "b", BucketPath: "s3://backup/", AccessKeyID: "KX", SecretAccessKey: "S", Region: "r", BaseURL: "https://s3.us-east-2.amazonaws.com/backup"},
 	}
-	p := newMultiProcessor(dests, h.dataDir, "*.gz", h.binary, notifier)
+	p := newMultiProcessor(dests, h.dataDir, "*.gz", h.binary, q)
 
 	t.Setenv("FAKE_FAIL_KEY", "KX")
 	if _, err := p.process(); err != nil {
 		t.Fatal(err)
 	}
-	if bodies, _ := rec.take(); len(bodies) != 0 {
-		t.Fatalf("unexpected webhook requests %q", bodies)
+	if bodies := drain(t, q); len(bodies) != 0 {
+		t.Fatalf("unexpected queued batches %q", bodies)
 	}
 
 	t.Setenv("FAKE_FAIL_KEY", "")
 	if _, err := p.process(); err != nil {
 		t.Fatal(err)
 	}
-	bodies, _ := rec.take()
+	bodies := drain(t, q)
 	wantBody := `[{"sha1":"` + sha1Hex("12345") + `","s3":["https://primary.s3.amazonaws.com/logs/a.gz","https://s3.us-east-2.amazonaws.com/backup/a.gz"],"file":[]}]`
 	if len(bodies) != 1 || bodies[0] != wantBody {
 		t.Fatalf("payload = %q, want %s", bodies, wantBody)
 	}
 }
 
-func TestWebhookRetries(t *testing.T) {
-	rec, notifier := newWebhookServer(t, http.StatusInternalServerError, http.StatusBadGateway)
-	entries := []webhookEntry{{SHA1: "x", S3: []string{}, File: []string{"/mnt/a"}}}
-	if err := notifier.send(entries); err != nil {
-		t.Fatalf("expected success on third attempt, got %v", err)
-	}
-	if bodies, _ := rec.take(); len(bodies) != 3 {
-		t.Fatalf("expected 3 attempts, got %d", len(bodies))
-	}
+func TestMultiKeepsSourcesUntilBatchQueued(t *testing.T) {
+	h := newMultiHarness(t, "a.gz")
+	q := newTestQueue(t)
+	p := newMultiProcessor(fileAndS3Destinations(t.TempDir()), h.dataDir, "*.gz", h.binary, q)
 
-	rec.statuses = []int{500, 500, 500}
-	if err := notifier.send(entries); err == nil || !strings.Contains(err.Error(), "giving up after 3 attempts") {
-		t.Fatalf("got %v", err)
-	}
-	if bodies, _ := rec.take(); len(bodies) != 3 {
-		t.Fatalf("expected 3 attempts, got %d", len(bodies))
-	}
-}
-
-func TestWebhookWithoutToken(t *testing.T) {
-	rec, notifier := newWebhookServer(t)
-	notifier.token = ""
-	if err := notifier.send([]webhookEntry{{SHA1: "x", S3: []string{}, File: []string{}}}); err != nil {
+	// A closed file makes every enqueue fail, as a full disk would.
+	q.f.Close()
+	summary, err := p.process()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, headers := rec.take(); headers[0].Get("Authorization") != "" {
-		t.Fatalf("unexpected Authorization header %q", headers[0].Get("Authorization"))
+	if _, err := os.Stat(h.files[0]); err != nil {
+		t.Fatal("source deleted although its webhook batch was not queued")
+	}
+	if summary.FilesDeleted != 0 || summary.FilesPending != 1 || len(p.unqueued) != 1 {
+		t.Fatalf("unexpected state: summary %+v, unqueued %d", summary, len(p.unqueued))
+	}
+	h.attempts(t)
+
+	reopened, err := openWebhookQueue(q.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.close() })
+	p.queue = reopened
+	summary, err = p.process()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := h.attempts(t); a != nil {
+		t.Fatalf("unexpected uploads after delivery: %q", a)
+	}
+	if _, err := os.Stat(h.files[0]); !os.IsNotExist(err) {
+		t.Fatal("source not deleted once its batch was queued")
+	}
+	if summary.FilesDeleted != 1 || len(p.unqueued) != 0 {
+		t.Fatalf("unexpected state: summary %+v, unqueued %d", summary, len(p.unqueued))
+	}
+	bodies := drain(t, reopened)
+	if len(bodies) != 1 || !strings.Contains(bodies[0], `"file":["a.gz"]`) {
+		t.Fatalf("queued batches = %q", bodies)
 	}
 }
 

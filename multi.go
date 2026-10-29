@@ -59,7 +59,11 @@ type multiProcessor struct {
 	folderPrefix string
 	pathSuffix   string
 	s5cmdBinary  string
-	notifier     *webhookNotifier
+	queue        *webhookQueue
+
+	// unqueued holds webhook batches that could not be written to the queue
+	// yet. Sources are not deleted while it is non-empty.
+	unqueued [][]webhookEntry
 
 	// delivered maps a local source path to the destinations that confirmed it.
 	delivered   map[string]map[string]bool
@@ -68,13 +72,13 @@ type multiProcessor struct {
 	sha1 map[string]string
 }
 
-func newMultiProcessor(dests []Destination, folderPrefix, pathSuffix, s5cmdBinary string, notifier *webhookNotifier) *multiProcessor {
+func newMultiProcessor(dests []Destination, folderPrefix, pathSuffix, s5cmdBinary string, queue *webhookQueue) *multiProcessor {
 	return &multiProcessor{
 		dests:        dests,
 		folderPrefix: folderPrefix,
 		pathSuffix:   pathSuffix,
 		s5cmdBinary:  s5cmdBinary,
-		notifier:     notifier,
+		queue:        queue,
 		delivered:    map[string]map[string]bool{},
 		lastSuccess:  map[string]int64{},
 		sha1:         map[string]string{},
@@ -112,6 +116,11 @@ func (p *multiProcessor) process() (Summary, error) {
 		}
 	}
 	if len(files) == 0 {
+		if p.queue != nil {
+			if err := p.flushUnqueued(); err != nil {
+				log.Printf("Error queueing webhook batch for job %s: %v", jobID, err)
+			}
+		}
 		return summary, nil
 	}
 
@@ -144,13 +153,21 @@ func (p *multiProcessor) process() (Summary, error) {
 		}
 	}
 
-	var entries []webhookEntry
-	if p.notifier != nil {
-		entries = p.batchEntries(files, results)
+	// The batch must be on disk before any source is deleted, so a crash
+	// cannot lose the notification for a deleted file.
+	queued := true
+	if p.queue != nil {
+		if entries := p.batchEntries(files, results); len(entries) > 0 {
+			p.unqueued = append(p.unqueued, entries)
+		}
+		if err := p.flushUnqueued(); err != nil {
+			log.Printf("Error queueing webhook batch for job %s, keeping source files until it is queued: %v", jobID, err)
+			queued = false
+		}
 	}
 
 	for _, f := range files {
-		if !p.deliveredEverywhere(f.source) {
+		if !p.deliveredEverywhere(f.source) || !queued {
 			if len(p.delivered[f.source]) > 0 {
 				summary.FilesPending++
 			}
@@ -167,13 +184,18 @@ func (p *multiProcessor) process() (Summary, error) {
 		}
 	}
 
-	if len(entries) > 0 {
-		if err := p.notifier.send(entries); err != nil {
-			log.Printf("Error sending webhook for job %s: %v", jobID, err)
-		}
-	}
-
 	return summary, nil
+}
+
+// flushUnqueued writes batches that could not be queued earlier, oldest first.
+func (p *multiProcessor) flushUnqueued() error {
+	for len(p.unqueued) > 0 {
+		if err := p.queue.enqueue(p.unqueued[0]); err != nil {
+			return err
+		}
+		p.unqueued = p.unqueued[1:]
+	}
+	return nil
 }
 
 // runDestinations copies every file a destination has not yet confirmed, for
